@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # =========================================================
-# Paths (عدّليهم لو مساراتك مختلفة)
+# Paths
 # =========================================================
 STAGE1_MODEL_PATH = "./cbc_stage1_model.joblib"
 STAGE2_MODEL_PATH = "./cbc_stage2_model.joblib"
@@ -21,8 +21,7 @@ STAGE2_LABEL_ENCODER_PATH = "./cbc_stage2_label_encoder.joblib"
 FEATURE_COLUMNS_PATH = "./cbc_feature_columns.joblib"
 FEATURE_MEDIANS_PATH = "./cbc_feature_medians.joblib"
 
-INDICATORS_ONTOLOGY_PATH = "./cbc_indicators_ontology.json"
-CONFIRMATORY_TESTS_PATH = "./confirmatory_tests.json"
+MEDICAL_ONTOLOGY_PATH = "./medical_ontology.json"
 
 # =========================================================
 # API Schemas
@@ -37,26 +36,30 @@ class PredictRequest(BaseModel):
     )
     cbc_flags: Optional[Dict[str, Flag]] = Field(
         default=None,
-        description="Optional lab flags per feature: LOW/NORMAL/HIGH/UNKNOWN. If omitted, UNKNOWN will be used.",
+        description="Optional lab flags per feature: LOW/NORMAL/HIGH/UNKNOWN.",
     )
     context: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Optional context (symptoms flags etc.) e.g. {'active_bleeding_symptoms_reported': true}",
+        description="Optional context (symptoms, diagnosis_hint, etc.)",
     )
     top_k: int = Field(default=3, ge=1, le=5)
 
 
 class PredictResponse(BaseModel):
     stage1: Dict[str, Any]
+    path: str  # "CBC" or "NON_CBC"
     top_predictions: List[Dict[str, Any]]
     ontology_support: List[Dict[str, Any]]
-    urgent_attention: Dict[str, Any]
+    urgent_attention: bool
     recommended_tests: List[Dict[str, Any]]
+    specialty: List[str]
+    red_flags: List[str]
+    warnings: List[str]
     disclaimer: str
 
 
 # =========================================================
-# Feature mapping (matches your model columns exactly)
+# Feature mapping
 # =========================================================
 MODEL_COLS = [
     "wbc",
@@ -74,7 +77,6 @@ MODEL_COLS = [
 ]
 
 ALIASES = {
-    # core
     "wbc": ["wbc", "white_blood_cells", "whitebloodcells", "wbc_count"],
     "rbc": ["rbc", "red_blood_cells", "redbloodcells", "rbc_count"],
     "hemoglobin": ["hemoglobin", "hgb", "hb"],
@@ -83,7 +85,6 @@ ALIASES = {
     "mch": ["mch"],
     "mchc": ["mchc"],
     "platelets": ["platelets", "plt", "platelet_count"],
-    # differential %
     "lymp_pct": [
         "lymp_pct",
         "lymph_pct",
@@ -94,13 +95,13 @@ ALIASES = {
         "lymphs_pct",
     ],
     "neut_pct": ["neut_pct", "neutrophils_percent", "neutrophils%", "neut_%", "neut%", "neutro_pct"],
-    # absolute counts
     "lymp_abs": ["lymp_abs", "lymph_abs", "lymphocytes_abs", "absolute_lymphocytes", "lymphocytes_absolute", "alc"],
     "neut_abs": ["neut_abs", "neutrophils_abs", "absolute_neutrophils", "neutrophils_absolute", "anc"],
 }
 
 
 def _norm(s: str) -> str:
+    """Normalize string keys for matching"""
     return (
         s.strip()
         .lower()
@@ -127,7 +128,7 @@ def map_input_to_model_features(raw_values: Dict[str, Any]) -> Dict[str, float]:
         nk = _norm(str(k))
         canon = ALIAS_TO_CANON.get(nk)
 
-        # small heuristics
+        # Small heuristics
         if canon is None:
             canon = ALIAS_TO_CANON.get(nk.replace("percent", "pct"))
 
@@ -141,7 +142,44 @@ def map_input_to_model_features(raw_values: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def build_feature_vector(raw_values: Dict[str, Any], feature_columns: List[str], medians: Dict[str, float]) -> pd.DataFrame:
+def validate_numeric_ranges(values: Dict[str, float]) -> List[str]:
+    """
+    Validate that numeric values are within reasonable clinical ranges.
+    Returns list of warnings.
+    """
+    warnings = []
+    
+    ranges = {
+        "wbc": (0.1, 100),
+        "rbc": (1.0, 8.0),
+        "hemoglobin": (3.0, 22.0),
+        "hematocrit": (10.0, 70.0),
+        "mcv": (50.0, 130.0),
+        "mch": (20.0, 40.0),
+        "mchc": (25.0, 40.0),
+        "platelets": (5.0, 1000.0),
+        "lymp_pct": (0.0, 100.0),
+        "neut_pct": (0.0, 100.0),
+        "lymp_abs": (0.0, 20.0),
+        "neut_abs": (0.0, 50.0),
+    }
+    
+    for key, (min_val, max_val) in ranges.items():
+        if key in values:
+            val = values[key]
+            if val < min_val or val > max_val:
+                warnings.append(
+                    f"{key.upper()} value {val} is outside typical range ({min_val}-{max_val})"
+                )
+    
+    return warnings
+
+
+def build_feature_vector(
+    raw_values: Dict[str, Any], 
+    feature_columns: List[str], 
+    medians: Dict[str, float]
+) -> pd.DataFrame:
     """
     - Map raw inputs -> canonical columns
     - Create a 1-row dataframe with exactly the required feature_columns
@@ -162,199 +200,7 @@ def build_feature_vector(raw_values: Dict[str, Any], feature_columns: List[str],
 
 
 # =========================================================
-# Flags helpers (for ontology)
-# =========================================================
-def normalize_flag(val: Any) -> str:
-    v = str(val).strip().upper()
-    return v if v in {"LOW", "NORMAL", "HIGH", "UNKNOWN"} else "UNKNOWN"
-
-
-def get_flag(flags: Optional[Dict[str, Flag]], feature: str) -> str:
-    if not flags:
-        return "UNKNOWN"
-
-    # try raw
-    if feature in flags:
-        return normalize_flag(flags[feature])
-
-    # normalized key
-    nf = _norm(feature)
-    if nf in flags:
-        return normalize_flag(flags[nf])
-
-    # alias -> canon
-    canon = ALIAS_TO_CANON.get(nf)
-    if canon and canon in flags:
-        return normalize_flag(flags[canon])
-
-    return "UNKNOWN"
-
-
-# =========================================================
-# Ontology engine
-# =========================================================
-def compute_derived_indicators(ontology: Dict[str, Any], flags: Optional[Dict[str, Flag]]) -> Dict[str, bool]:
-    """
-    Minimal interpreter for the derived_indicators logic in your ontology.
-    Expected logic format:
-      [{"if_flag": {"hemoglobin":"LOW"}, "then": true}, {"else": false}]
-    """
-    derived: Dict[str, bool] = {}
-    for ind_name, ind_def in ontology.get("derived_indicators", {}).items():
-        logic = ind_def.get("logic", [])
-        result = False
-        for step in logic:
-            if "if_flag" in step:
-                conds = step["if_flag"]
-                ok = True
-                for feat, needed in conds.items():
-                    if get_flag(flags, feat) != normalize_flag(needed):
-                        ok = False
-                        break
-                if ok:
-                    result = bool(step.get("then", True))
-                    break
-            if "else" in step:
-                result = bool(step["else"])
-        derived[ind_name] = result
-    return derived
-
-
-def score_condition_support(
-    rule: Dict[str, Any],
-    derived: Dict[str, bool],
-    flags: Optional[Dict[str, Flag]],
-) -> Tuple[int, List[str], List[str], str]:
-    scoring = rule.get("support_scoring", {})
-    score = 0
-    supports: List[str] = []
-    contradictions: List[str] = []
-
-    for item in scoring.get("support_indicators", []):
-        if "indicator" in item:
-            name = item["indicator"]
-            if derived.get(name, False):
-                score += int(item.get("weight", 0))
-                supports.append(name)
-        elif "feature_flag" in item:
-            ff = item["feature_flag"]
-            ok = True
-            for feat, needed in ff.items():
-                if get_flag(flags, feat) != normalize_flag(needed):
-                    ok = False
-                    break
-            if ok:
-                score += int(item.get("weight", 0))
-                supports.append(f"flag:{ff}")
-
-    for item in scoring.get("contradictions", []):
-        if "indicator" in item:
-            name = item["indicator"]
-            if derived.get(name, False):
-                score += int(item.get("weight", 0))  # negative expected
-                contradictions.append(name)
-        elif "feature_flag" in item:
-            ff = item["feature_flag"]
-            ok = True
-            for feat, needed in ff.items():
-                if get_flag(flags, feat) != normalize_flag(needed):
-                    ok = False
-                    break
-            if ok:
-                score += int(item.get("weight", 0))  # negative expected
-                contradictions.append(f"flag:{ff}")
-
-    level = "NO_SUPPORT"
-    levels = scoring.get("support_levels", [])
-    levels_sorted = sorted(levels, key=lambda x: int(x.get("min_score", -999)), reverse=True)
-    for lv in levels_sorted:
-        if score >= int(lv.get("min_score", -999)):
-            level = lv.get("level", "NO_SUPPORT")
-            break
-
-    return score, supports, contradictions, level
-
-
-def urgent_attention(
-    ontology: Dict[str, Any],
-    values_mapped: Dict[str, float],
-    flags: Optional[Dict[str, Flag]],
-    context: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Uses:
-      - ontology default urgent output
-      - ontology flag-based rules
-      - conservative numeric fallback thresholds for demo safety (optional)
-    """
-    rules = ontology.get("urgent_attention_rules", {})
-    out = (rules.get("default_urgent_output") or {}).copy()
-    out.setdefault("urgent_flag", False)
-    out.setdefault("reasons", [])
-    out.setdefault("suggested_action", "Seek urgent medical care if severe symptoms exist.")
-
-    symptoms = context or {}
-
-    # flag-based rules
-    for r in rules.get("flag_based_urgent_rules", []):
-        cond = r.get("if", {})
-        ok = True
-        for feat, needed in cond.items():
-            if get_flag(flags, feat) != normalize_flag(needed):
-                ok = False
-                break
-        if not ok:
-            continue
-
-        and_any = r.get("and_any", [])
-        if and_any and not any(bool(symptoms.get(x, False)) for x in and_any):
-            continue
-
-        then = r.get("then", {})
-        if then.get("urgent_flag") is True:
-            out["urgent_flag"] = True
-            out["reasons"].append(then.get("reason", r.get("name", "urgent_rule")))
-
-    # numeric fallback (optional - remove if you want strict flag-only)
-    hb = values_mapped.get("hemoglobin")
-    plt = values_mapped.get("platelets")
-    wbc = values_mapped.get("wbc")
-
-    if hb is not None and hb < 7.0:
-        out["urgent_flag"] = True
-        out["reasons"].append("Very low hemoglobin (Hb < 7 g/dL) may be urgent depending on symptoms.")
-    if plt is not None and plt < 20.0:
-        out["urgent_flag"] = True
-        out["reasons"].append("Very low platelets (PLT < 20) may increase bleeding risk.")
-    if wbc is not None and (wbc < 2.0 or wbc > 30.0):
-        out["urgent_flag"] = True
-        out["reasons"].append("Extreme WBC values may require urgent evaluation.")
-
-    return out
-
-
-def recommended_tests_from_indicators(ontology: Dict[str, Any], derived: Dict[str, bool]) -> List[Dict[str, Any]]:
-    recs: List[Dict[str, Any]] = []
-    for block in ontology.get("recommended_tests_by_indicator", []):
-        when_any = block.get("when_any_indicators_true", [])
-        if any(derived.get(ind, False) for ind in when_any):
-            for t in block.get("tests", []):
-                recs.append(t)
-
-    recs.sort(key=lambda x: int(x.get("priority", 99)))
-    seen = set()
-    out = []
-    for t in recs:
-        name = t.get("test")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        out.append(t)
-    return out
-
-
-# =========================================================
-# App + Lifespan loading (no deprecated on_event)
+# App + Lifespan loading
 # =========================================================
 ARTIFACTS: Dict[str, Any] = {}
 
@@ -369,15 +215,16 @@ async def lifespan(app: FastAPI):
         ARTIFACTS["feature_columns"] = joblib.load(FEATURE_COLUMNS_PATH)
         ARTIFACTS["feature_medians"] = joblib.load(FEATURE_MEDIANS_PATH)
 
-        with open(INDICATORS_ONTOLOGY_PATH, "r", encoding="utf-8") as f:
-            ARTIFACTS["indicators_ontology"] = json.load(f)
-        with open(CONFIRMATORY_TESTS_PATH, "r", encoding="utf-8") as f:
-            ARTIFACTS["confirmatory_tests"] = json.load(f)
+        with open(MEDICAL_ONTOLOGY_PATH, "r", encoding="utf-8") as f:
+            ARTIFACTS["medical_ontology"] = json.load(f)
+
+        # Load stage1 threshold if available
+        ARTIFACTS["stage1_threshold"] = 0.6  # Default, override if stored
 
         # Optional sanity check
         cols = list(ARTIFACTS["feature_columns"])
         if cols != MODEL_COLS:
-            print("WARNING: Loaded feature_columns != expected MODEL_COLS")
+            print("⚠️  WARNING: Loaded feature_columns != expected MODEL_COLS")
             print("Loaded :", cols)
             print("Expect :", MODEL_COLS)
 
@@ -397,13 +244,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware to allow frontend requests
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173", 
         "http://127.0.0.1:5173",
-        "http://localhost:8080",  # Vite alternative port
+        "http://localhost:8080",
         "http://127.0.0.1:8080",
         "http://localhost:8081",
         "http://127.0.0.1:8081",
@@ -426,135 +273,236 @@ def health():
 # =========================================================
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
+
     if not ARTIFACTS:
-        raise HTTPException(status_code=500, detail="Artifacts not loaded.")
+        raise HTTPException(status_code=500, detail="Artifacts not loaded")
 
-    feature_columns: List[str] = list(ARTIFACTS["feature_columns"])
-    medians: Dict[str, float] = ARTIFACTS["feature_medians"]
+    warnings = []
 
-    # mapped values (canonical)
+    # ======================================================
+    # 1️⃣ Validate input
+    # ======================================================
+    
+    # Map to canonical keys first
     values_mapped = map_input_to_model_features(req.cbc_values)
+    
+    # Validate numeric ranges
+    range_warnings = validate_numeric_ranges(values_mapped)
+    warnings.extend(range_warnings)
+    
+    # Check minimum required fields
+    required = ["hemoglobin", "wbc", "platelets", "mcv"]
+    missing_required = [f for f in required if f not in values_mapped]
 
-    X = build_feature_vector(req.cbc_values, feature_columns, medians)
-
-    stage1_model = ARTIFACTS["stage1_model"]
-    stage2_model = ARTIFACTS["stage2_model"]
-    le = ARTIFACTS["label_encoder"]
-
-    # ---- Stage 1
-    try:
-        raw_pred = stage1_model.predict(X)[0]
-        stage1_conf = None
-        if hasattr(stage1_model, "predict_proba"):
-            stage1_conf = float(np.max(stage1_model.predict_proba(X)[0]))
-
-        # Determine significance based on prediction type
-        if isinstance(raw_pred, str):
-            # If model returns strings like 'non_cbc_related' vs 'cbc_related' (or others)
-            # We treat 'non_cbc_related' as False (not significant)
-            clinically_significant = (raw_pred != 'non_cbc_related')
-        else:
-            # Numeric case (0 vs 1)
-            clinically_significant = (int(raw_pred) == 1)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stage1 failed: {e}")
-
-    stage1_out = {
-        "clinically_significant_cbc": bool(clinically_significant),
-        "confidence": stage1_conf,
-        "note": "Screening only (CBC findings significance). Not a diagnosis.",
-    }
-
-    # ---- Stage 2 (Top-K)
-    top_preds: List[Dict[str, Any]] = []
-    if clinically_significant:
-        try:
-            probs = stage2_model.predict_proba(X)[0]
-            idxs = np.argsort(probs)[::-1][: req.top_k]
-
-            if hasattr(stage2_model, "classes_"):
-                raw = stage2_model.classes_
-                picked = [raw[i] for i in idxs]
-                if len(picked) and isinstance(picked[0], (int, np.integer)) and hasattr(le, "inverse_transform"):
-                    labels = le.inverse_transform(np.array(picked))
-                else:
-                    labels = picked
-            else:
-                labels = le.inverse_transform(idxs)
-
-            for rank, (i, label) in enumerate(zip(idxs, labels), start=1):
-                top_preds.append(
-                    {
-                        "rank": rank,
-                        "condition": str(label),
-                        "probability": float(probs[i]),
-                        "probability_percent": round(float(probs[i]) * 100, 2),
-                    }
-                )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Stage2 failed: {e}")
-    else:
-        top_preds = [
-            {"rank": 1, "condition": "healthy", "probability": 1.0, "probability_percent": 100.0}
-        ]
-
-    # ---- Ontology: indicators + support scoring
-    ontology = ARTIFACTS["indicators_ontology"]
-    derived = compute_derived_indicators(ontology, req.cbc_flags)
-
-    support_results: List[Dict[str, Any]] = []
-    for rule in ontology.get("pattern_support_rules", []):
-        cond = rule.get("condition", "UNKNOWN_CONDITION")
-        score, supports, contradictions, level = score_condition_support(rule, derived, req.cbc_flags)
-        support_results.append(
-            {
-                "condition": cond,
-                "support_score": score,
-                "support_level": level,
-                "supporting_indicators": supports,
-                "contradictions": contradictions,
-            }
+    if missing_required:
+        warnings.append(
+            f"Missing key CBC fields: {', '.join(missing_required)}. "
+            "Predictions may be unreliable."
         )
 
-    # ---- Urgency
-    urgent = urgent_attention(ontology, values_mapped, req.cbc_flags, req.context)
+    # ======================================================
+    # 2️⃣ Align features
+    # ======================================================
+    feature_columns = ARTIFACTS["feature_columns"]
+    medians = ARTIFACTS["feature_medians"]
 
-    # ---- Recommended tests:
-    confirm_map: Dict[str, List[Dict[str, Any]]] = ARTIFACTS["confirmatory_tests"]
-    tests: List[Dict[str, Any]] = []
+    X = build_feature_vector(values_mapped, feature_columns, medians)
 
-    # A) condition-based tests (from confirmatory_tests.json)
+    # ======================================================
+    # 3️⃣ Stage-1 Gate (CBC relevance)
+    # ======================================================
+    stage1_model = ARTIFACTS["stage1_model"]
+    stage1_threshold = ARTIFACTS.get("stage1_threshold", 0.6)
+
+    try:
+        proba = (
+            stage1_model.predict_proba(X)[0][1]
+            if hasattr(stage1_model, "predict_proba")
+            else float(stage1_model.predict(X)[0])
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stage-1 prediction failed: {e}")
+
+    cbc_related = proba >= stage1_threshold
+
+    stage1_out = {
+        "cbc_related_probability": round(float(proba), 3),
+        "cbc_related": bool(cbc_related),
+        "threshold": float(stage1_threshold),
+        "note": "Screening gate only, not diagnostic",
+    }
+
+    ontology = ARTIFACTS["medical_ontology"]
+
+    # ======================================================
+    # 4️⃣ NON-CBC PATH (Ontology routing)
+    # ======================================================
+    if not cbc_related:
+
+        non_cbc_rules = ontology.get("non_cbc_related", {})
+        matched = []
+
+        # Extract text for matching from context
+        diagnosis_hint = ""
+        if req.context:
+            diagnosis_hint = str(req.context.get("diagnosis_hint", "")).lower()
+            # You can also check other context fields as needed
+            for key, value in req.context.items():
+                if isinstance(value, str):
+                    diagnosis_hint += " " + value.lower()
+
+        # Match patterns
+        for rule in non_cbc_rules.get("patterns", []):
+            keywords = rule.get("keywords", [])
+            if any(k.lower() in diagnosis_hint for k in keywords):
+                matched.append(rule)
+
+        # If no matches, use default
+        if not matched and non_cbc_rules.get("default"):
+            matched.append(non_cbc_rules["default"])
+
+        return PredictResponse(
+            stage1=stage1_out,
+            path="NON_CBC",
+            top_predictions=[],
+            ontology_support=[],
+            urgent_attention=any(r.get("red_flag", False) for r in matched),
+            recommended_tests=[
+                {
+                    "test": t,
+                    "reason": rule.get("reason", ""),
+                    "priority": rule.get("priority", 2),
+                }
+                for rule in matched
+                for t in rule.get("recommended_tests", [])
+            ],
+            specialty=list({r.get("specialty") for r in matched if r.get("specialty")}),
+            red_flags=[r.get("red_flag_text", "") for r in matched if r.get("red_flag")],
+            warnings=warnings,
+            disclaimer=ontology.get(
+                "global_disclaimer",
+                "Clinical decision support only. Not a diagnosis. Always consult a healthcare provider."
+            ),
+        )
+
+    # ======================================================
+    # 5️⃣ CBC PATH — Stage-2 Classification
+    # ======================================================
+    stage2_model = ARTIFACTS["stage2_model"]
+    label_encoder = ARTIFACTS["label_encoder"]
+
+    try:
+        probs = stage2_model.predict_proba(X)[0]
+        # Get indices of the top-k highest probabilities
+        top_indices_local = np.argsort(probs)[::-1][: req.top_k]
+        
+        # Get the internal class labels (integers) from the model
+        model_classes = stage2_model.classes_
+        predicted_class_codes = [model_classes[i] for i in top_indices_local]
+
+        # Decode integer labels to string names using the label encoder
+        decoded_labels = label_encoder.inverse_transform(predicted_class_codes)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stage-2 prediction failed: {e}")
+
+    top_preds = [
+        {
+            "rank": i + 1,
+            "condition": str(decoded_labels[i]),
+            "probability": float(probs[top_indices_local[i]]),
+            "probability_percent": round(float(probs[top_indices_local[i]]) * 100, 2),
+        }
+        for i in range(len(decoded_labels))
+    ]
+
+    # ======================================================
+    # 6️⃣ CBC Ontology enrichment
+    # ======================================================
+    enriched = []
+    all_red_flags = []
+    all_specialties = set()
+    all_tests = []
+
     for p in top_preds:
         key = _norm(p["condition"])
-        candidates = [key, key.replace(" ", "_"), key.replace("/", "_")]
-        for cand in candidates:
-            if cand in confirm_map:
-                tests.extend(confirm_map[cand])
-                break
+        info = ontology.get("cbc_conditions", {}).get(key, {})
 
-    # B) indicator-based tests (complement)
-    tests.extend(recommended_tests_from_indicators(ontology, derived))
+        # Extract confirmatory tests with priority
+        conf_tests = info.get("confirmatory_tests", [])
+        if isinstance(conf_tests, list):
+            for test in conf_tests:
+                if isinstance(test, dict):
+                    all_tests.append(test)
+                else:
+                    # If it's just a string
+                    all_tests.append({
+                        "test": test,
+                        "priority": 2,
+                        "reason": f"For evaluating {p['condition']}"
+                    })
 
-    # sort & deduplicate by test name
-    tests.sort(key=lambda x: int(x.get("priority", 99)))
-    seen = set()
-    uniq_tests = []
-    for t in tests:
-        nm = t.get("test")
-        if not nm or nm in seen:
-            continue
-        seen.add(nm)
-        uniq_tests.append(t)
+        # Collect red flags
+        red_flags = info.get("red_flags", [])
+        all_red_flags.extend(red_flags)
 
+        # Collect specialties
+        specialty = info.get("specialty")
+        if specialty:
+            all_specialties.add(specialty)
+
+        enriched.append({
+            **p,
+            "likely_causes": info.get("likely_causes", []),
+            "confirmatory_tests": conf_tests,
+            "specialty": specialty,
+            "red_flags": red_flags,
+        })
+
+    # Deduplicate and sort tests by priority
+    seen_tests = set()
+    unique_tests = []
+    for test in sorted(all_tests, key=lambda x: x.get("priority", 99)):
+        test_name = test.get("test")
+        if test_name and test_name not in seen_tests:
+            seen_tests.add(test_name)
+            unique_tests.append(test)
+
+    urgent = len(all_red_flags) > 0
+
+    # ======================================================
+    # 7️⃣ Final Response
+    # ======================================================
     return PredictResponse(
         stage1=stage1_out,
-        top_predictions=top_preds,
-        ontology_support=support_results,
+        path="CBC",
+        top_predictions=enriched,
+        ontology_support=[],  # Can be extended with indicator-based support
         urgent_attention=urgent,
-        recommended_tests=uniq_tests,
+        recommended_tests=unique_tests,
+        specialty=list(all_specialties),
+        red_flags=list(set(all_red_flags)),
+        warnings=warnings,
         disclaimer=ontology.get(
             "global_disclaimer",
-            "This analysis is for clinical decision support only and must be reviewed by a qualified healthcare professional.",
+            "Clinical decision support only. Not a diagnosis. Always consult a healthcare provider."
         ),
     )
+
+
+# =========================================================
+# Optional: Add endpoint to get ontology conditions
+# =========================================================
+@app.get("/conditions")
+def get_conditions():
+    """Return list of all CBC conditions in ontology"""
+    if not ARTIFACTS or "medical_ontology" not in ARTIFACTS:
+        raise HTTPException(status_code=500, detail="Ontology not loaded")
+    
+    ontology = ARTIFACTS["medical_ontology"]
+    conditions = ontology.get("cbc_conditions", {})
+    
+    return {
+        "conditions": list(conditions.keys()),
+        "count": len(conditions)
+    }
