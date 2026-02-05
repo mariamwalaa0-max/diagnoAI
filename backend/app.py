@@ -405,6 +405,10 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:8080",  # Vite alternative port
         "http://127.0.0.1:8080",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:8082",
+        "http://127.0.0.1:8082",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -439,16 +443,22 @@ def predict(req: PredictRequest):
 
     # ---- Stage 1
     try:
-        stage1_pred = int(stage1_model.predict(X)[0])
+        raw_pred = stage1_model.predict(X)[0]
         stage1_conf = None
         if hasattr(stage1_model, "predict_proba"):
             stage1_conf = float(np.max(stage1_model.predict_proba(X)[0]))
+
+        # Determine significance based on prediction type
+        if isinstance(raw_pred, str):
+            # If model returns strings like 'non_cbc_related' vs 'cbc_related' (or others)
+            # We treat 'non_cbc_related' as False (not significant)
+            clinically_significant = (raw_pred != 'non_cbc_related')
+        else:
+            # Numeric case (0 vs 1)
+            clinically_significant = (int(raw_pred) == 1)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stage1 failed: {e}")
-
-    # NOTE: Assumption: stage1_pred == 1 means clinically significant CBC.
-    # If your model uses opposite mapping, flip this line:
-    clinically_significant = (stage1_pred == 1)
 
     stage1_out = {
         "clinically_significant_cbc": bool(clinically_significant),

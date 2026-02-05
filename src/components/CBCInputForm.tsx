@@ -16,6 +16,7 @@ interface CBCField {
   normalMin: number;
   normalMax: number;
   placeholder: string;
+  required?: boolean;
 }
 
 const cbcFields: CBCField[] = [
@@ -28,6 +29,7 @@ const cbcFields: CBCField[] = [
     normalMin: 4.5,
     normalMax: 11.0,
     placeholder: "4.5-11.0",
+    required: true,
   },
   {
     name: "rbc",
@@ -48,6 +50,7 @@ const cbcFields: CBCField[] = [
     normalMin: 12,
     normalMax: 17,
     placeholder: "12-17",
+    required: true,
   },
   {
     name: "hematocrit",
@@ -68,6 +71,7 @@ const cbcFields: CBCField[] = [
     normalMin: 150,
     normalMax: 400,
     placeholder: "150-400",
+    required: true,
   },
   {
     name: "mcv",
@@ -78,6 +82,7 @@ const cbcFields: CBCField[] = [
     normalMin: 80,
     normalMax: 100,
     placeholder: "80-100",
+    required: true,
   },
   {
     name: "mch",
@@ -181,7 +186,9 @@ export function CBCInputForm() {
   };
 
   const validateField = (field: CBCField, value: string): string | null => {
-    if (!value.trim()) return null; // Optional for now
+    if (!value.trim()) {
+      return field.required ? "This field is required" : null;
+    }
     const numValue = parseFloat(value);
     if (isNaN(numValue)) return "Invalid number";
     if (numValue < field.min || numValue > field.max) {
@@ -211,8 +218,17 @@ export function CBCInputForm() {
     });
 
     if (!hasValues) {
-      newErrors["general"] = "Please enter at least one CBC value";
+      // Logic checked required fields individually, but if everything is empty and no required fields were triggered (unlikely given the new logic),
+      // we might want a general error. However, with individual required fields, we might not need this "at least one" check if required fields exist.
+      // But if the user didn't touch anything, errors won't show up until submit validation runs, which we are doing here.
     }
+    
+    // If no specific field errors but literally nothing was entered (e.g. all optional?), ensure we have something?
+    // Actually, if required fields are present, validation will fail.
+    // If we only have optional fields provided, that's fine? Logic implies at least required ones must be there.
+    // So we can remove the "at least one" check if we trust the required fields check.
+    // But let's keep a sanity check if we want to ensure meaningful analysis.
+    // For now, let's rely on the field validation.
 
     setErrors(newErrors);
     if (Object.keys(newErrors).length > 0) return;
@@ -266,7 +282,10 @@ export function CBCInputForm() {
             className="space-y-2"
           >
             <label className="flex items-center justify-between text-sm">
-              <span className="font-medium text-foreground">{field.label}</span>
+              <span className="font-medium text-foreground">
+                {field.label}
+                {field.required && <span className="text-destructive ml-1">*</span>}
+              </span>
               <span className="text-muted-foreground text-xs">
                 {field.unit}
               </span>
